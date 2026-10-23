@@ -1,0 +1,238 @@
+name: Windows release
+
+# 只有显式触发才发布：手动 workflow_dispatch，或推送 v* 版本标签。
+# 日常 push / PR 仍由 windows.yml 负责构建与回归，本工作流不重复跑。
+#
+# 产物（挂在 GitHub Release 上）：
+#   fqapp-desktop-<版本>-windows-x64-portable.zip   解压即用的便携版
+#   fqapp-desktop-<版本>-windows-x64-setup.exe      Inno Setup 安装包
+#   *.sha256 / SHA256SUMS                          校验文件
+#
+# 安装包由仓库内 scripts/build_windows_installer.ps1 + scripts/installer/fqapp.iss 生成，
+# 与便携包使用同一份 release 二进制，不重新编译应用代码。
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '发布标签（留空则自动使用 v<pubspec 版本>）'
+        required: false
+        type: string
+      prerelease:
+        description: '标记为预发布（Pre-release）'
+        required: false
+        type: boolean
+        default: false
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: '1.99.1'
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          flutter-version: '3.44.6'
+          channel: stable
+          cache: true
+
+      - name: Resolve release version and tag
+        id: version
+        shell: pwsh
+        run: |
+          $manifest = Get-Content -LiteralPath pubspec.yaml -Raw
+          if ($manifest -notmatch '(?m)^version:\s*(\d+\.\d+\.\d+)\+\d+\s*$') {
+            throw 'Cannot read application version from pubspec.yaml'
+          }
+          $version = $Matches[1]
+          $tag = '${{ inputs.tag }}'
+          if ([string]::IsNullOrWhiteSpace($tag)) { $tag = "v$version" }
+          if ($env:GITHUB_REF_TYPE -eq 'tag') { $tag = $env:GITHUB_REF_NAME }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          Write-Output "Release tag: $tag"
+          Write-Output "Application version: $version"
+
+      - name: Resolve dependencies
+        run: flutter pub get
+
+      - name: Analyze application
+        run: flutter analyze --no-pub
+
+      - name: Test layout and playback lifecycle
+        run: >-
+          flutter test --no-pub
+          test/desktop_detail_layout_test.dart test/desktop_platform_test.dart
+          test/desktop_video_layout_test.dart test/player_page_test.dart
+          test/book_open_entry_test.dart
+
+      - name: Restore matching release binaries
+        id: bundle-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            build/windows/x64/runner/Release
+            rust/target/release/fqapi_core.dll
+          key: windows-3.44.6-rust1.99.1-${{ runner.arch }}-v1-${{ hashFiles('lib/**', 'pubspec.*', 'rust/Cargo.*', 'rust/src/**', 'rust/assets/**', 'rust/build.rs', 'native/**', 'assets/**', 'windows/runner/**', 'windows/CMakeLists.txt', 'windows/flutter/CMakeLists.txt', 'third_party/**') }}
+
+      - name: Build Windows release
+        if: steps.bundle-cache.outputs.cache-hit != 'true'
+        run: flutter build windows --release --target lib/main.dart
+
+      - name: Save verified-source release binaries
+        if: steps.bundle-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            build/windows/x64/runner/Release
+            rust/target/release/fqapi_core.dll
+          key: ${{ steps.bundle-cache.outputs.cache-primary-key }}
+
+      - name: Collect licenses and assemble bundle
+        shell: pwsh
+        run: |
+          python scripts/collect_windows_licenses.py
+          if ($LASTEXITCODE -ne 0) { throw 'License collection failed' }
+          $src = 'build/windows/x64/runner/Release'
+          foreach ($file in @('fqapp.exe','flutter_windows.dll','fqapi_core.dll','libmpv-2.dll','data/app.so')) {
+            if (-not (Test-Path -LiteralPath "$src/$file")) { throw "Incomplete Windows release bundle: $file" }
+          }
+          Copy-Item -LiteralPath LICENSE -Destination "$src/LICENSE.txt" -Force
+          Copy-Item -LiteralPath WINDOWS.md -Destination "$src/使用说明.md" -Force
+          if (-not (Test-Path -LiteralPath "$src/licenses/fqapp-GPL-3.0.txt")) {
+            throw 'GPL license file missing from the bundle'
+          }
+          Write-Output "Bundle ready: $((Get-ChildItem -LiteralPath $src -Recurse -File | Measure-Object Length -Sum).Sum / 1MB) MB"
+
+      - name: Package portable archive
+        shell: pwsh
+        run: |
+          $version = '${{ steps.version.outputs.version }}'
+          $src = 'build/windows/x64/runner/Release'
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          $name = "fqapp-desktop-$version-windows-x64-portable.zip"
+          Compress-Archive -Path "$src/*" -DestinationPath "dist/$name"
+          $hash = (Get-FileHash -LiteralPath "dist/$name" -Algorithm SHA256).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText("dist/$name.sha256", "$hash  $name`n", [Text.UTF8Encoding]::new($false))
+          Write-Output "Portable: dist/$name"
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Test-Path -LiteralPath 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe')) {
+            choco install innosetup --yes --no-progress
+            if ($LASTEXITCODE -ne 0) { throw 'Inno Setup installation failed' }
+          }
+          $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path -LiteralPath $iscc)) { throw "ISCC.exe not found at $iscc" }
+          Write-Output "ISCC: $iscc"
+
+      - name: Build Windows installer
+        shell: pwsh
+        run: |
+          pwsh -File scripts/build_windows_installer.ps1
+          if ($LASTEXITCODE -ne 0) { throw "Installer build failed: $LASTEXITCODE" }
+          Get-ChildItem -LiteralPath dist | Select-Object Name,Length | Format-Table -AutoSize | Out-String -Width 200
+
+      - name: Verify the installer end to end
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem -LiteralPath dist -Filter '*setup.exe' | Select-Object -First 1
+          if (-not $installer) { throw 'No installer produced' }
+          $target = Join-Path $env:RUNNER_TEMP 'fqapp-install-check'
+          if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Recurse -Force }
+          Start-Process -FilePath $installer.FullName -Wait -ArgumentList @(
+            '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-','/LOG=' + (Join-Path $env:RUNNER_TEMP 'fqapp-install.log'), "/DIR=$target"
+          )
+          foreach ($file in @('fqapp.exe','fqapi_core.dll','libmpv-2.dll','data/app.so','LICENSE.txt','使用说明.md')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $target $file))) { throw "Silent install is missing $file" }
+          }
+          Write-Output "Silent install verified at $target"
+          $uninstaller = Join-Path $target 'unins000.exe'
+          if (Test-Path -LiteralPath $uninstaller) {
+            Start-Process -FilePath $uninstaller -Wait -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART')
+          }
+
+      - name: Write checksums and release notes
+        shell: pwsh
+        run: |
+          $version = '${{ steps.version.outputs.version }}'
+          $files = Get-ChildItem -LiteralPath dist -File | Where-Object { $_.Name -notlike '*.sha256' } | Sort-Object Name
+          $lines = foreach ($file in $files) {
+            $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($file.Name)"
+          }
+          [IO.File]::WriteAllLines('dist/SHA256SUMS.txt', $lines, [Text.UTF8Encoding]::new($false))
+          $lines | ForEach-Object { Write-Output $_ }
+
+          $notes = @(
+            "## 番茄小铺 · 电脑版 $version"
+            ''
+            'Windows 10/11 x64。两种安装方式，任选其一：'
+            ''
+            "1. fqapp-desktop-$version-windows-x64-setup.exe —— 安装包，可选安装目录，生成开始菜单与桌面快捷方式，无需管理员权限，可在“应用和功能”中卸载。"
+            "2. fqapp-desktop-$version-windows-x64-portable.zip —— 便携版，解压完整目录后运行 fqapp.exe，不要单独移动 EXE。"
+            ''
+            '首次启动需联网初始化。已下载的书籍与媒体可从应用内离线入口打开。'
+            '网页导入需要 Microsoft Edge WebView2 Runtime；系统朗读使用已安装的 Windows 语音。'
+            ''
+            '### 构建信息'
+            ''
+            "- 提交：$env:GITHUB_SHA"
+            "- 工作流：$env:GITHUB_WORKFLOW 运行 $env:GITHUB_RUN_ID"
+            '- 安装包与便携包来自同一份 release 二进制，安装包已通过静默安装校验。'
+            ''
+            '### 许可'
+            ''
+            'GPL-3.0，上游项目 ch6vip/fqapp。第三方组件许可证随程序一并分发（licenses 目录）。校验值见 SHA256SUMS.txt。'
+          )
+          New-Item -ItemType Directory -Path build -Force | Out-Null
+          [IO.File]::WriteAllLines('build/release-notes.md', $notes, [Text.UTF8Encoding]::new($false))
+          Write-Output "Release notes written for $version"
+
+      - name: Publish GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = '${{ steps.version.outputs.tag }}'
+          $assets = @(Get-ChildItem -LiteralPath dist -File | ForEach-Object { $_.FullName })
+          $flagArgs = @()
+          if ('${{ inputs.prerelease }}' -eq 'true') { $flagArgs += '--prerelease' }
+
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Output "Release $tag already exists; replacing assets"
+            gh release upload $tag @assets --clobber
+            if ($LASTEXITCODE -ne 0) { throw 'Asset upload failed' }
+            $editArgs = @('release', 'edit', $tag, '--notes-file', 'build/release-notes.md') + $flagArgs
+            gh @editArgs
+            if ($LASTEXITCODE -ne 0) { throw 'Release edit failed' }
+          } else {
+            $title = '番茄小铺 · 电脑版 ' + '${{ steps.version.outputs.version }}'
+            $createArgs = @('release', 'create', $tag)
+            # 标签由本次推送创建时已存在，此时不能再传 --target，否则 gh 会报错。
+            git ls-remote --exit-code --tags origin "refs/tags/$tag" *> $null
+            if ($LASTEXITCODE -ne 0) { $createArgs += @('--target', $env:GITHUB_SHA) }
+            $createArgs += @('--title', $title, '--notes-file', 'build/release-notes.md')
+            $createArgs += $flagArgs
+            $createArgs += $assets
+            gh @createArgs
+            if ($LASTEXITCODE -ne 0) { throw 'Release creation failed' }
+          }
+          gh release view $tag --json tagName,url,assets --jq '{tag:.tagName,url:.url,assets:[.assets[]|{name,size}]}'
