@@ -7,6 +7,10 @@
 Windows 10/11 x64：解压完整目录后运行 `fqapp.exe`，不要单独移动 EXE。
 也可运行 `fqapp-desktop-<版本>-windows-x64-setup.exe` 安装：支持选择安装目录、
 开始菜单/桌面快捷方式及卸载，无需管理员权限。卸载保留当前用户的书架、进度和缓存。
+
+已发布的安装包和便携包见 [Releases](https://github.com/ShiYao3286/fqapp/releases)，
+由 `.github/workflows/windows-release.yml` 构建：手动运行该工作流或推送 `v*` 标签即可
+重新出包，安装包生成后会在 CI 中做一次静默安装自检，通过才发布。
 首次启动需联网初始化；已下载的书籍及媒体可从应用内离线入口打开。
 数据保存在当前用户的应用数据目录，不依赖解压目录。备份使用原版 JSON 格式。
 官方网页导入需要 Microsoft Edge WebView2 Runtime，并由用户在官方网页完成登录。
