@@ -185,7 +185,7 @@ jobs:
             ''
             'Windows 10/11 x64。两种安装方式，任选其一：'
             ''
-            "1. fqapp-desktop-$version-windows-x64-setup.exe —— 安装包，可选安装目录，生成开始菜单与桌面快捷方式，无需管理员权限，可在“应用和功能”中卸载。"
+            "1. fqapp-desktop-$version-windows-x64-setup.exe —— 安装包，可选安装目录，生成开始菜单与桌面快捷方式，无需管理员权限，可在 设置 > 应用 中卸载。"
             "2. fqapp-desktop-$version-windows-x64-portable.zip —— 便携版，解压完整目录后运行 fqapp.exe，不要单独移动 EXE。"
             ''
             '首次启动需联网初始化。已下载的书籍与媒体可从应用内离线入口打开。'
