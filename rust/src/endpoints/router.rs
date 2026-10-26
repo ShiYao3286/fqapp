@@ -33,6 +33,10 @@ pub fn match_rest_path(path: &str, query: &Params) -> Option<RouteMatch> {
         "books" => match_books(tail, query),
         "novels" => match_novels(tail, query),
         "search" => match_search(tail, query),
+        "category" => Some(RouteMatch {
+            api: "category_front",
+            params: query.clone(),
+        }),
         "audio" => match_audio(tail, query),
         "authors" => match_authors(tail, query),
         "manga" => match_manga(tail, query),
@@ -102,6 +106,15 @@ fn match_chapters(parts: &[&str], q: &Params) -> Option<RouteMatch> {
             p.set("item_id", id);
             Some(RouteMatch {
                 api: "audio_timeline",
+                params: p,
+            })
+        }
+        // 听书与正文的同步映射（官方 AudioTimePointResponse）：
+        // 按音频毫秒直出「第几段第几个字符」，是听书高亮的唯一数据源。
+        "timepoints" => {
+            p.set("item_id", id);
+            Some(RouteMatch {
+                api: "audio_timepoint",
                 params: p,
             })
         }
@@ -248,6 +261,10 @@ fn match_search(parts: &[&str], q: &Params) -> Option<RouteMatch> {
         }
         "hot" => Some(RouteMatch {
             api: "hot_search",
+            params: p,
+        }),
+        "cue" => Some(RouteMatch {
+            api: "search_cue",
             params: p,
         }),
         _ => None,

@@ -16,6 +16,8 @@ import '../services/app_theme.dart';
 import '../services/backend_transport.dart';
 import '../services/chapter_cache_store.dart';
 import '../services/chapter_text_formatter.dart';
+import '../services/text_replacement_engine.dart';
+import '../services/text_replacement_store.dart';
 import '../services/library_store.dart';
 import '../services/listening_session.dart';
 import '../services/reader_device.dart';
@@ -44,6 +46,7 @@ import '../widgets/reader/reader_status_bar.dart';
 import '../widgets/reader/reader_text_selection.dart';
 import '../widgets/reader/reader_theme.dart';
 import 'audio_page.dart';
+import 'text_replacement_page.dart';
 
 typedef ChapterTextLoader = Future<String> Function(Chapter chapter);
 typedef _LoadedChapter = ({String text, bool fetched});
@@ -75,6 +78,8 @@ class ReaderPage extends StatefulWidget {
 
   /// Local 划线 storage. Defaults to the device-wide box.
   final ReaderUnderlineStore? underlineStore;
+  final TextReplacementStore? replacementStore;
+  final TextReplacementEngine? replacementEngine;
 
   /// Paragraph ideas for the current chapter. When both this and
   /// [commentResolver] are null the reader fetches them itself, unless a
@@ -106,6 +111,8 @@ class ReaderPage extends StatefulWidget {
     this.commentResolver,
     this.shelfItem,
     this.underlineStore,
+    this.replacementStore,
+    this.replacementEngine,
   });
 
   @override
@@ -133,6 +140,104 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
 
   String _content = '';
   ChapterContent _chapterContent = ChapterContent(blocks: const []);
+  TextReplacementResult? _replacement;
+  TextReplacementCancellation? _replacementCancellation;
+  int _replacementGeneration = 0;
+  TextReplacementStore get _replacementStore =>
+      widget.replacementStore ?? TextReplacementStore.instance;
+
+  Future<TextReplacementResult> _replaceContent(
+    ChapterContent content,
+    String title,
+  ) async {
+    _replacementCancellation?.cancel();
+    final cancellation = _replacementCancellation =
+        TextReplacementCancellation();
+    await _replacementStore.load();
+    while (true) {
+      final snapshot = _replacementStore.snapshot;
+      final result =
+          await (widget.replacementEngine ?? TextReplacementEngine.instance)
+              .transform(
+                source: content,
+                chapterTitle: title,
+                snapshot: snapshot,
+                cancellation: cancellation,
+              );
+      if (cancellation.cancelled ||
+          snapshot.revision == _replacementStore.snapshot.revision) {
+        return result;
+      }
+    }
+  }
+
+  Future<void> _onReplacementChanged() async {
+    if (!mounted || _loading || _error != null) return;
+    final generation = ++_replacementGeneration;
+    final loadGeneration = _loadGeneration;
+    final chapter = _chapter;
+    _captureScrollProgress();
+    final text = _chapterCache[chapter.itemId] ?? _content;
+    final content = text == _content
+        ? _chapterContent
+        : ChapterContent.fromCacheText(text);
+    final legacyRefresh = text != _content && !_chapterContent.hasImages;
+    final position = _needsRestore
+        ? _savedPosition
+        : <String, dynamic>{
+            'chapterId': chapter.itemId,
+            'positionVersion': legacyRefresh ? 1 : 2,
+            'textOffset': legacyRefresh
+                ? _chapterLayout?.legacyOffsetForText(_textOffset) ??
+                      _textOffset
+                : _chapterLayout?.sourceOffsetForDisplay(_textOffset) ??
+                      _textOffset,
+          };
+    final result = await _replaceContent(content, chapter.title);
+    if (!mounted ||
+        generation != _replacementGeneration ||
+        loadGeneration != _loadGeneration) {
+      return;
+    }
+    setState(() {
+      _content = text;
+      _chapterContent = content;
+      _replacement = result;
+      _savedPosition = position;
+      _narrationRange = null;
+      _selection = null;
+      _selectionBarOpen = false;
+      _chapterLayout = null;
+      _needsRestore = true;
+      _progressReady = false;
+    });
+    if (result.error != null) _showMessage('本章替换失败，已显示原文：${result.error}');
+  }
+
+  List<ReaderRangeUnderline> get _displayRangeUnderlines {
+    final layout = _chapterLayout;
+    if (layout == null || _replacement == null) return _rangeUnderlines;
+    return [
+      for (final mark in _rangeUnderlines)
+        if (layout.displayOffsetForSource(
+              mark.end,
+              bias: TextBoundaryBias.end,
+            ) >
+            layout.displayOffsetForSource(mark.start))
+          ReaderRangeUnderline(
+            bookId: mark.bookId,
+            chapterId: mark.chapterId,
+            start: layout.displayOffsetForSource(mark.start),
+            end: layout.displayOffsetForSource(
+              mark.end,
+              bias: TextBoundaryBias.end,
+            ),
+            text: mark.text,
+            createdAt: mark.createdAt,
+          ),
+    ];
+  }
+
   ChapterIdeas _ideas = ChapterIdeas.empty;
   bool _loading = true;
   bool _progressReady = false;
@@ -167,9 +272,15 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
 
   /// 全局墨水屏模式覆盖阅读器显示预设（#15/#9）：开启时阅读器强制纯黑白，
   /// 不改用户保存的预设，关闭后恢复原预设。夜间切换等仍写保存的预设。
-  ReaderThemePreset get _effectivePreset => einkModeNotifier.value
-      ? ReaderThemePreset.eink
-      : _preferences.themePreset;
+  ///
+  /// 全局 OLED 纯黑同理：只在深色外观下生效，所以阅读背景强制到夜间预设
+  ///（颜色再由 [ReaderThemeColors.isOled] 降到 #000000），退出深色后回到
+  /// 原预设。
+  ReaderThemePreset get _effectivePreset {
+    if (einkModeNotifier.value) return ReaderThemePreset.eink;
+    if (oledActive()) return ReaderThemePreset.dark;
+    return _preferences.themePreset;
+  }
 
   /// 排版用的偏好：墨水屏模式下把预设换成 eink，正文/标题才是 #000000。
   ///
@@ -178,17 +289,25 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
   /// 两处直接传 [_preferences]，于是全局墨水屏开启后正文仍用用户保存预设的
   /// textColor（默认米白 #292724）——实测设备上正文主色 RGB(41,39,36)，
   /// 墨水屏把它量化成明显发灰的一档。保存的预设不动，关闭墨水屏即恢复。
-  ReaderPreferences get _displayPreferences => einkModeNotifier.value
-      ? _preferences.copyWith(
-          themePreset: ReaderThemePreset.eink,
-          // 墨水屏最低 500 字重：Flutter 没有关亚像素抗锯齿的 API，
-          // 加粗是唯一能用的笔画加深手段。
-          fontWeight: einkEffectiveFontWeight(
-            eink: true,
-            fontWeight: _preferences.fontWeight,
-          ),
-        )
-      : _preferences;
+  ReaderPreferences get _displayPreferences {
+    if (einkModeNotifier.value) {
+      return _preferences.copyWith(
+        themePreset: ReaderThemePreset.eink,
+        // 墨水屏最低 500 字重：Flutter 没有关亚像素抗锯齿的 API，
+        // 加粗是唯一能用的笔画加深手段。
+        fontWeight: einkEffectiveFontWeight(
+          eink: true,
+          fontWeight: _preferences.fontWeight,
+        ),
+      );
+    }
+    // OLED：正文 / 标题颜色同样要走夜间，否则排版层会继续用保存预设的浅色
+    // 纸面正文色，在纯黑底上既刺眼又和背景对不上。
+    if (oledActive()) {
+      return _preferences.copyWith(themePreset: ReaderThemePreset.dark);
+    }
+    return _preferences;
+  }
 
   /// 原生层（MainActivity.dispatchKeyEvent）拦截到音量键后回调：仅在阅读页
   /// 当前路由、未显示控制栏、已开启音量键翻页、且为分页模式时翻页。
@@ -253,31 +372,58 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
   /// 切章或未在读本章时清空。
   (int, int)? _narrationRange;
 
-  void _syncNarrationHighlight() {
-    if (!mounted) return;
-    final layout = _chapterLayout;
-    (int, int)? next;
+  /// The passage being narrated, in layout coordinates, or null when this
+  /// chapter is not the one on the voice.
+  ///
+  /// Two sources, two coordinate systems. System TTS reports offsets into the
+  /// TTS text blob; 听书 reports the backend's (paragraph, offset) timeline.
+  /// Each is translated by its own mapper so neither can smear the highlight
+  /// onto the wrong paragraph.
+  (int, int)? _narrationLayoutRange(ReaderChapterLayout layout) {
     final session = ListeningSession.instance;
-    if (_preferences.narrationHighlight &&
-        layout != null &&
-        session.matches(widget.bookId, _chapter.itemId)) {
-      final ttsRange = session.sentenceRange;
-      if (ttsRange != null) {
-        final translated = narrationLayoutRange(layout, ttsRange);
-        if (translated != null) {
-          next = (translated.start, translated.end);
-        }
-      }
+    if (!session.matches(widget.bookId, _chapter.itemId)) return null;
+    final audioRange = session.audioParaRange;
+    if (audioRange != null) {
+      final translated = audioTimePointLayoutRange(
+        layout,
+        audioRange.startPara,
+        audioRange.startOff,
+        audioRange.endPara,
+        // The upstream end offset is inclusive (official
+        // `toTargetTextBlock` passes `endParaOff + 1`); this side is
+        // half-open, so the +1 belongs here.
+        audioRange.endOff + 1,
+        startElementIndex: audioRange.elemIndex,
+        startElementOffset: audioRange.elemOff,
+      );
+      return translated == null ? null : (translated.start, translated.end);
     }
+    final ttsRange = session.sentenceRange;
+    if (ttsRange == null ||
+        session.textReplacementRevision !=
+            (_replacement?.snapshotRevision ?? 0)) {
+      return null;
+    }
+    final translated = narrationLayoutRange(layout, ttsRange);
+    return translated == null ? null : (translated.start, translated.end);
+  }
+
+  void _syncNarrationHighlight((int, int)? narration) {
+    if (!mounted) return;
+    // The follow anchor still uses [narration] when the wash is switched off;
+    // only painting depends on the preference.
+    final next = _preferences.narrationHighlight ? narration : null;
     if (next != _narrationRange) {
       setState(() => _narrationRange = next);
     }
   }
 
   void _onListeningTick() {
-    _syncNarrationHighlight();
-    if (!mounted ||
-        !_routeCurrent ||
+    if (!mounted) return;
+    final layout = _chapterLayout;
+    final narration = layout == null ? null : _narrationLayoutRange(layout);
+    _syncNarrationHighlight(narration);
+    if (!_routeCurrent ||
         !_appActive ||
         !_preferences.listeningFollow ||
         _autoTurnTimer != null ||
@@ -298,13 +444,29 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
       return;
     }
     if (!session.matches(widget.bookId, _chapter.itemId)) return;
-    final progress = session.progress;
+    // Land on the page holding the start of the sentence under the voice.
+    // The progress ratio is only a fallback: pages do not hold equal amounts
+    // of text (titles, illustrations, paragraph breaks), so a proportional
+    // jump parks the reader a page or two off the highlight.
+    final anchor = narration?.$1;
     if (_paged) {
-      _pagedKey.currentState?.followProgress(progress);
+      final paged = _pagedKey.currentState;
+      if (anchor != null) {
+        paged?.followOffset(anchor);
+      } else {
+        paged?.followProgress(session.progress);
+      }
     } else if (_scrollController.hasClients) {
       final position = _scrollController.position;
       if (position.maxScrollExtent > 0) {
-        _scrollController.jumpTo(progress * position.maxScrollExtent);
+        _scrollController.jumpTo(
+          anchor == null || layout == null
+              ? session.progress * position.maxScrollExtent
+              : layout
+                    .scrollForTextOffset(anchor)
+                    .clamp(0.0, position.maxScrollExtent)
+                    .toDouble(),
+        );
       }
     }
   }
@@ -468,6 +630,7 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
     VolumeKeyService.instance.setOnVolumeKey(_onVolumeKey);
     _syncVolumeKeyEnabled();
     ListeningSession.instance.addListener(_onListeningTick);
+    _replacementStore.changes.addListener(_onReplacementChanged);
     WidgetsBinding.instance.addObserver(this);
     // 小米公平运行内存：KILL 广播到达时刷一次阅读进度，避免被杀丢进度。
     _unregisterFairMemoryFlush = FairMemoryService.instance
@@ -651,7 +814,7 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
     ReaderRangeUnderline? hit;
     final pressed = _marksScope?.geometry.chapterOffsetAt(position);
     if (pressed != null) {
-      for (final underline in _rangeUnderlines) {
+      for (final underline in _displayRangeUnderlines) {
         if (underline.start <= pressed && pressed < underline.end) {
           hit = underline;
           break;
@@ -835,6 +998,17 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
     setState(() => _selection = null);
   }
 
+  bool _markMatchesSelection(
+    ReaderRangeUnderline mark,
+    ReaderTextSelection selection,
+  ) {
+    final layout = _chapterLayout;
+    return layout != null &&
+        layout.displayOffsetForSource(mark.start) == selection.start &&
+        layout.displayOffsetForSource(mark.end, bias: TextBoundaryBias.end) ==
+            selection.end;
+  }
+
   bool get _selectionUnderlined {
     final selection = _selection;
     if (selection == null) return false;
@@ -846,7 +1020,7 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
     // identity: a whole-paragraph drag can produce one, and only the range
     // store can ever remove it again.
     return _rangeUnderlines.any(
-      (underline) => underline.coversExactly(selection.start, selection.end),
+      (underline) => _markMatchesSelection(underline, selection),
     );
   }
 
@@ -889,7 +1063,7 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
       // paragraph-identity store here would strand it, unreachable for
       // 删除划线 forever.
       final hasExactRange = _rangeUnderlines.any(
-        (underline) => underline.coversExactly(selection.start, selection.end),
+        (underline) => _markMatchesSelection(underline, selection),
       );
       if (block != null && !hasExactRange) {
         await _toggleUnderline(block, add: add);
@@ -900,25 +1074,33 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
     final chapterId = _chapter.itemId;
     final loadGeneration = _loadGeneration;
     final existing = _rangeUnderlines
-        .where(
-          (underline) =>
-              underline.coversExactly(selection.start, selection.end),
-        )
+        .where((underline) => _markMatchesSelection(underline, selection))
         .toList();
     if (!add && existing.isEmpty) return;
     final record = ReaderRangeUnderline(
       bookId: widget.bookId,
       chapterId: chapterId,
-      start: selection.start,
-      end: selection.end,
-      text: layout.textInRange(selection.start, selection.end),
+      start: layout.sourceOffsetForDisplay(selection.start),
+      end: layout.sourceOffsetForDisplay(
+        selection.end,
+        bias: TextBoundaryBias.end,
+      ),
+      text: layout.sourceTextInRange(
+        layout.sourceOffsetForDisplay(selection.start),
+        layout.sourceOffsetForDisplay(
+          selection.end,
+          bias: TextBoundaryBias.end,
+        ),
+      ),
       createdAt: DateTime.now().millisecondsSinceEpoch,
     );
     try {
       if (add) {
         await store.addRange(record);
       } else {
-        await store.remove(existing.first.key);
+        for (final mark in existing) {
+          await store.remove(mark.key);
+        }
       }
     } catch (_) {
       if (mounted) _showMessage(add ? '划线保存失败，请重试' : '删除划线失败，请重试');
@@ -938,7 +1120,9 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
           ..sort((a, b) => a.start.compareTo(b.start));
       } else {
         _rangeUnderlines = _rangeUnderlines
-            .where((underline) => underline.key != existing.first.key)
+            .where(
+              (underline) => !existing.any((mark) => mark.key == underline.key),
+            )
             .toList();
       }
     });
@@ -963,7 +1147,13 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
             chapterId: chapterId,
             paraIndex: block.paraIndex,
             blockIndex: blockIndex,
-            text: block.text,
+            text: _chapterLayout!.sourceTextInRange(
+              _chapterLayout!.sourceOffsetForDisplay(block.start),
+              _chapterLayout!.sourceOffsetForDisplay(
+                block.end,
+                bias: TextBoundaryBias.end,
+              ),
+            ),
             createdAt: DateTime.now().millisecondsSinceEpoch,
           ),
         );
@@ -1052,6 +1242,9 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
     VolumeKeyService.instance.setOnVolumeKey(null);
     unawaited(VolumeKeyService.instance.setEnabled(false));
     ListeningSession.instance.removeListener(_onListeningTick);
+    _replacementStore.changes.removeListener(_onReplacementChanged);
+    _replacementCancellation?.cancel();
+    ++_replacementGeneration;
     _unregisterFairMemoryFlush?.call();
     _unregisterFairMemoryFlush = null;
     _autoTurnTimer?.cancel();
@@ -1109,6 +1302,8 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
   }) async {
     if (widget.chapters.isEmpty) return;
     final generation = ++_loadGeneration;
+    _replacementCancellation?.cancel();
+    ++_replacementGeneration;
     final chapter = _chapter;
     _saveTimer?.cancel();
     setState(() {
@@ -1116,6 +1311,7 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
       _progressReady = false;
       _error = null;
       _content = '';
+      _replacement = null;
       _chapterContent = ChapterContent(blocks: const []);
       _chapterLayout = null;
       _layoutMode = null;
@@ -1146,7 +1342,15 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
       if (content.withoutLeadingTitle(chapter.title).isEmpty) {
         throw ApiException('正文为空');
       }
+      final replacement = await _replaceContent(content, chapter.title);
+      if (!mounted || generation != _loadGeneration) return;
+      if (_chapterCache[chapter.itemId] != null &&
+          _chapterCache[chapter.itemId] != text) {
+        await _load(startAtEnd: startAtEnd, chapterTurn: chapterTurn);
+        return;
+      }
       setState(() {
+        _replacement = replacement;
         _content = text;
         _chapterContent = content;
         _savedPosition = saved;
@@ -1165,6 +1369,9 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
           _lastEinkRefreshChapterId != chapter.itemId) {
         _lastEinkRefreshChapterId = chapter.itemId;
         unawaited(EinkRefreshService.instance.requestRefresh());
+      }
+      if (replacement.error != null) {
+        _showMessage('本章替换失败，已显示原文：${replacement.error}');
       }
       unawaited(_prefetchAround(_index));
       unawaited(_loadIdeas(chapter, generation));
@@ -1429,8 +1636,17 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
           revision != (_chapterCacheRevisions[chapter.itemId] ?? 0)) {
         return;
       }
-      _onChapterContentAvailable(chapter, text);
-      if (!catalogReady) return;
+      final update = _onChapterContentAvailable(chapter, text);
+      // The callback publishes its raw cache revision synchronously before
+      // awaiting conversion. A newer batch may supersede it during that await.
+      final publishedRevision = _chapterCacheRevisions[chapter.itemId] ?? 0;
+      await update;
+      if (!catalogReady ||
+          !mounted ||
+          publishedRevision != (_chapterCacheRevisions[chapter.itemId] ?? 0) ||
+          _chapterCache[chapter.itemId] != text) {
+        return;
+      }
       try {
         await _diskCache.write(
           bookId: widget.bookId,
@@ -1458,7 +1674,7 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
 
   // Note: 批量补图与预取共享缓存版本，迟到旧结果不能覆盖新图文；见
   // .agents/notes/implemented/bug-fix/2026-09-10-reader-illustrations.md
-  void _onChapterContentAvailable(Chapter chapter, String text) {
+  Future<void> _onChapterContentAvailable(Chapter chapter, String text) async {
     // A cache hit must not invalidate an in-flight signature refresh.
     if (!mounted || _chapterCache[chapter.itemId] == text) return;
     final fetched = ChapterContent.fromCacheText(text);
@@ -1479,10 +1695,20 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
     if (_loading || chapter.itemId != _chapter.itemId || text == _content) {
       return;
     }
+    final generation = ++_replacementGeneration;
+    final loadGeneration = _loadGeneration;
+    final replacement = await _replaceContent(content, chapter.title);
+    if (!mounted ||
+        generation != _replacementGeneration ||
+        loadGeneration != _loadGeneration ||
+        chapter.itemId != _chapter.itemId ||
+        _chapterCache[chapter.itemId] != text) {
+      return;
+    }
     final hasImages = _chapterContent.hasImages;
     final restoring = _needsRestore;
     final offset = hasImages
-        ? _textOffset
+        ? _chapterLayout?.sourceOffsetForDisplay(_textOffset) ?? _textOffset
         : _chapterLayout?.legacyOffsetForText(_textOffset) ?? _textOffset;
     setState(() {
       if (restoring) {
@@ -1501,6 +1727,8 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
       }
       _content = text;
       _chapterContent = content;
+      _replacement = replacement;
+      _selection = null;
       _chapterLayout = null;
       _layoutMode = null;
       _needsRestore = true;
@@ -1625,6 +1853,7 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
         : ReaderChapterLayout(
             title: _chapter.title,
             content: _chapterContent,
+            replacement: _replacement,
             spec: spec,
             paragraphBubbles: bubblesVisible ? _ideas.bubbleCounts : const {},
             paragraphBubbleVariants: bubblesVisible
@@ -1841,7 +2070,8 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
       'position': position,
       'maxScroll': max,
       'positionVersion': 2,
-      'textOffset': _textOffset,
+      'textOffset':
+          _chapterLayout?.sourceOffsetForDisplay(_textOffset) ?? _textOffset,
       'progress': progress,
       'cover': widget.cover,
       'time': DateTime.now().millisecondsSinceEpoch,
@@ -2042,6 +2272,13 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
     if (fontChanged) unawaited(_loadFont(preferences.fontPath));
   }
 
+  Future<void> _showTextReplacement() => Navigator.push<void>(
+    context,
+    MaterialPageRoute(
+      builder: (_) => TextReplacementPage(store: _replacementStore),
+    ),
+  );
+
   Future<void> _showAppearanceSettings() async {
     setState(() => _controlsVisible = false);
     await showModalBottomSheet<void>(
@@ -2056,8 +2293,13 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
       builder: (context) => ReaderAppearanceSheet(
         initialValue: _preferences,
         einkOverride: einkModeNotifier.value,
+        oledOverride: oledActive(),
         onChanged: _previewPreferences,
         onPickFont: _pickFont,
+        onTextReplacement: () {
+          Navigator.pop(context);
+          unawaited(_showTextReplacement());
+        },
       ),
     );
     // 墨水屏：排版面板关闭后刷一次，清掉面板残影。
@@ -2068,7 +2310,12 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
   void _toggleNightTheme() {
     // 全局墨水屏覆盖显示，点夜间不会有任何可见变化，先提示而非静默无响应。
     if (einkModeNotifier.value) {
-      _showMessage('全局墨水屏模式已开启，先在设置里关闭它再切换夜间');
+      _showMessage('全局墨水屏已开启，先在 设置 → 外观 换成其它主题');
+      return;
+    }
+    // OLED 同理：阅读背景被全局纯黑接管，点夜间看不出变化。
+    if (oledActive()) {
+      _showMessage('全局 OLED 纯黑已开启，先在 设置 → 外观 关闭它再切换背景');
       return;
     }
     final nextPreset = _preferences.themePreset == ReaderThemePreset.dark
@@ -2163,14 +2410,21 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
     _openingListening = true;
     try {
       _stopAutoTurn();
+      final snapshot = _replacementStore.snapshot;
+      final replacement = _replacement;
+      if (replacement == null ||
+          replacement.snapshotRevision != snapshot.revision) {
+        _showMessage('正文替换正在更新，请稍后重试');
+        return;
+      }
       final content = _chapterContent;
       final chapter = _chapter;
       var offset = 0;
       if (textId != null) {
-        final body = content.withoutLeadingTitle(chapter.title);
+        final body = replacement.bodyBlocks(chapter.title);
         var found = false;
-        for (var i = 0; i < body.blocks.length; i++) {
-          final block = body.blocks[i];
+        for (var i = 0; i < body.length; i++) {
+          final block = body[i];
           if (block is! ChapterParagraph) continue;
           if (paragraphUnderlineId(paraIndex: block.paraIndex, blockIndex: i) ==
               textId) {
@@ -2186,9 +2440,12 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
       final book = SystemTtsBook(
         bookId: widget.bookId,
         title: widget.title,
+        coverUrl: widget.cover,
         chapters: widget.chapters,
         startIndex: _index,
         initialContent: content,
+        replacementSnapshot: snapshot,
+        replacementStore: _replacementStore,
         startOffset: offset,
         localOnly: widget.localOnly,
         textLoader: widget.chapterLoader,
@@ -2334,7 +2591,9 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
   DateTime _desktopWheelAt = DateTime.fromMillisecondsSinceEpoch(0);
 
   void _desktopScroll(PointerSignalEvent signal) {
-    if (!_paged || signal is! PointerScrollEvent || signal.scrollDelta.dy == 0) {
+    if (!_paged ||
+        signal is! PointerScrollEvent ||
+        signal.scrollDelta.dy == 0) {
       return;
     }
     GestureBinding.instance.pointerSignalResolver.register(signal, (_) {
@@ -2620,8 +2879,7 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
                 return IconButton(
                   key: const ValueKey('reader-shelf-button'),
                   tooltip: inShelfNow ? '已在书架' : '加入书架',
-                  onPressed: () =>
-                      unawaited(toggleShelf(context, _shelfEntry)),
+                  onPressed: () => unawaited(toggleShelf(context, _shelfEntry)),
                   icon: Icon(
                     inShelfNow
                         ? LucideIcons.bookmark_check
@@ -2666,6 +2924,33 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
                 child: CircularProgressIndicator(color: preset.accentColor),
               )
             : _errorView(textColor: preset.textColor),
+      );
+    }
+    if (_replacement?.bodyIsEmpty(_chapter.title) == true) {
+      return Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text('本章正文已被替换规则清空'),
+            TextButton(
+              onPressed: _showTextReplacement,
+              child: const Text('编辑规则'),
+            ),
+            TextButton(
+              onPressed: () async {
+                try {
+                  await _replacementStore.save(
+                    enabled: false,
+                    rules: _replacementStore.snapshot.rules,
+                  );
+                } catch (_) {
+                  if (mounted) _showMessage('替换规则保存失败');
+                }
+              },
+              child: const Text('停用正文替换'),
+            ),
+          ],
+        ),
       );
     }
     return LayoutBuilder(
@@ -2730,7 +3015,7 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
                         onParagraphLongPressEnd: _onParagraphLongPressEnd,
                         selectionScope: scope,
                         selection: _selection,
-                        rangeUnderlines: _rangeUnderlines,
+                        rangeUnderlines: _displayRangeUnderlines,
                         narrationRange: _narrationRange,
                       )
                     : _buildScrollContent(layout, scope),
@@ -3061,7 +3346,7 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
                 imageProviderFactory: widget.imageProviderFactory,
                 selectionScope: scope,
                 selection: _selection,
-                rangeUnderlines: _rangeUnderlines,
+                rangeUnderlines: _displayRangeUnderlines,
                 narrationRange: _narrationRange,
                 onParagraphLongPress: (block, position) =>
                     unawaited(_onParagraphLongPress(block, position)),

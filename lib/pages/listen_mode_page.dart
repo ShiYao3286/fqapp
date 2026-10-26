@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 
 import '../models/media_item.dart';
 import '../services/api_client.dart';
+import '../services/app_theme.dart';
 import '../services/audio_preferences.dart';
 import '../services/episode_source_cache.dart';
 import '../services/native_player.dart';
@@ -156,7 +157,8 @@ class _ListenModePageState extends State<ListenModePage>
       await previous?.dispose();
       NativePlayer? created;
       try {
-        final player = (widget.playerFactory ?? NativePlayer.new)();
+        final player =
+            (widget.playerFactory ?? () => NativePlayer(audioOnly: true))();
         created = player;
         await player.create(url, keyHex);
         await player.setRate(_rate);
@@ -225,6 +227,8 @@ class _ListenModePageState extends State<ListenModePage>
     return NativePlayer.startListenForeground(
       title: widget.seriesTitle,
       episode: _episodeTitle(_index),
+      // 通知左上角与系统媒体卡片显示的就是这张封面（对齐官方）。
+      coverUrl: widget.coverUrl,
       playing: player?.playWhenReady ?? true,
       hasPrev: _index > 0,
       hasNext: _index < widget.episodes.length - 1,
@@ -267,7 +271,11 @@ class _ListenModePageState extends State<ListenModePage>
       },
       child: Scaffold(
       key: const ValueKey('listen-page'),
-      backgroundColor: const Color(0xFF121212),
+      // 全屏听书页是整块大底色：OLED 纯黑生效时降到 #000000 省电，
+      // 其余深色模式保持官方 #121212。AppBar / 按钮本来就是透明 + 白字。
+      backgroundColor: oledActive()
+          ? Colors.black
+          : const Color(0xFF121212),
       appBar: AppBar(
         backgroundColor: Colors.transparent,
         foregroundColor: Colors.white,
